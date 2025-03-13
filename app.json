@@ -31,9 +31,6 @@
       "favicon": "./assets/favicon.png"
     },
     "extra": {
-      "eas": {
-        "projectId": "f43694fb-ee54-4fb3-9091-467b54e0d062"
-      }
     },
     "owner": "hq77",
     "runtimeVersion": {

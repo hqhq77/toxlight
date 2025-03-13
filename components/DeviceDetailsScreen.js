@@ -1,3 +1,350 @@
+
+
+//________________________________________________________________--
+//v8 global connection
+import React, { useState, useEffect, useRef } from 'react';
+import { View, Text, TouchableOpacity, Alert, Linking, Dimensions, SafeAreaView } from 'react-native';
+import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
+import { LineChart } from 'react-native-chart-kit';
+import { Container, theme } from '../config/theme';
+import { rtdb, saveRecordToFirebase } from '../config/firebase';
+import { ref, onValue, off } from 'firebase/database';
+import { useEsp32Connection } from '../Esp32ConnectionContext'; // Adjust the path as needed
+
+function DeviceDetailsScreen({ route, navigation, devices, setDevices }) {
+  const { deviceIndex } = route.params || {};
+  const device = deviceIndex >= 0 && deviceIndex < devices.length ? devices[deviceIndex] : null;
+
+  const time = 10; // monitoring time in seconds
+  const totalTimeMs = time * 1000;
+  const [isMonitoring, setIsMonitoring] = useState(false);
+  const [timeLeft, setTimeLeft] = useState(time);
+  const [showGraph, setShowGraph] = useState(false);
+  const [binaryData, setBinaryData] = useState([]); // [{ value: 0 or 1, timestamp: ms }, ...]
+  const binaryDataRef = useRef([]);
+  const [startTime, setStartTime] = useState(null);
+  const timerRef = useRef(null);
+
+  // Firebase states (only for buttonState, since ESP32 connection is global)
+  const [buttonState, setButtonState] = useState(null);
+  const detectorRef = useRef(null);
+
+  // Get ESP32 connection status from global context
+  const { isEspConnected } = useEsp32Connection();
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 1. Listen to Firebase for buttonState only (ESP32 connection is handled globally)
+  // ─────────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const buttonRef = ref(rtdb, 'buttonState');
+
+    const buttonUnsubscribe = onValue(buttonRef, (snapshot) => {
+      if (snapshot.exists()) {
+        setButtonState(snapshot.val());
+      }
+    });
+
+    return () => {
+      buttonUnsubscribe();
+    };
+  }, []);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 2. Timer countdown logic
+  // ─────────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (isMonitoring) {
+      timerRef.current = setInterval(() => {
+        setTimeLeft((prev) => prev - 1);
+      }, 1000);
+    }
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [isMonitoring]);
+
+  // If time runs out, stop monitoring
+  useEffect(() => {
+    if (timeLeft <= 0 && isMonitoring) {
+      setIsMonitoring(false);
+      finishMonitoring();
+    }
+  }, [timeLeft, isMonitoring]);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 3. Collect data from Firebase detectorStatus while monitoring
+  // ─────────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    let unsubscribe;
+    if (isMonitoring && startTime) {
+      detectorRef.current = ref(rtdb, 'detectorStatus');
+      unsubscribe = onValue(detectorRef.current, (snapshot) => {
+        if (snapshot.exists()) {
+          const value = snapshot.val(); // 0 or 1 from the sensor
+          const currentTime = Date.now();
+          const timestamp = currentTime - startTime; // ms since we started
+
+          // Only store data if within totalTimeMs
+          if (timestamp <= totalTimeMs) {
+            setBinaryData((prev) => {
+              const newData = [...prev, { value, timestamp }];
+              binaryDataRef.current = newData;
+              return newData;
+            });
+          }
+        }
+      });
+    }
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+      if (detectorRef.current) off(detectorRef.current);
+    };
+  }, [isMonitoring, startTime]);
+
+  // Keep the ref updated with latest array
+  useEffect(() => {
+    binaryDataRef.current = binaryData;
+  }, [binaryData]);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 4. Start monitoring
+  // ─────────────────────────────────────────────────────────────────────────────
+  const handleStartMonitor = () => {
+    // if (!device?.isConnected) {
+    //   Alert.alert('Device not connected', 'Please connect this device first.');
+    //   return;
+    // }
+    if (!isEspConnected) {
+      Alert.alert('ESP32 Disconnected', 'Please check the ESP32 WiFi connection.');
+      return;
+    }
+    if (!isReady) {
+      Alert.alert('Cap not close', 'Please close the cap properly.');
+      return;
+    }
+    // Reset
+    setTimeLeft(time);
+    setBinaryData([]);
+    binaryDataRef.current = [];
+
+    setStartTime(Date.now());
+    setShowGraph(true);
+    setIsMonitoring(true);
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 5. Finish monitoring and save to Firebase
+  // ─────────────────────────────────────────────────────────────────────────────
+  const finishMonitoring = () => {
+    const dataToSave = binaryDataRef.current;
+    if (dataToSave.length === 0) {
+      Alert.alert('No Data', 'No data was collected during monitoring.');
+      return;
+    }
+
+    // Basic logic: if more than half are "1", we say "Safe to consume"
+    const onesCount = dataToSave.filter((entry) => entry.value === 1).length;
+    const status = onesCount > dataToSave.length / 2 ? 'Safe to consume' : 'Might not be safe';
+    const color = onesCount > dataToSave.length / 2 ? '#32CD32' : '#FF4500';
+
+    const newRecord = {
+      location: 'Klang',
+      date: new Date().toLocaleDateString('en-GB'), // e.g. "01/03/2025"
+      time: new Date().toLocaleTimeString('en-US', {
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+      }), // e.g. "14:30"
+      status,
+      color,
+      dataset: dataToSave,
+    };
+
+    saveRecordToFirebase(newRecord)
+      .then(() => {
+        Alert.alert('Monitoring Complete', 'Data has been saved to Firebase.');
+      })
+      .catch((error) => {
+        Alert.alert('Error', 'Failed to save data: ' + error.message);
+      });
+
+    // setShowGraph(false);
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 6. Early return if no device
+  // ─────────────────────────────────────────────────────────────────────────────
+  if (!device) {
+    return (
+      <Container>
+        <Text style={{ color: theme.colors.text }}>Device not found!</Text>
+      </Container>
+    );
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // 7. Display states
+  // ─────────────────────────────────────────────────────────────────────────────
+  const minutes = Math.floor(timeLeft / 60);
+  const seconds = timeLeft % 60;
+  const isReady = buttonState === 1;
+  const statusColor = isEspConnected && isReady ? theme.colors.safe : theme.colors.warning;
+  const statusText = isEspConnected && isReady ? 'Ready' : 'Not Ready';
+  const screenWidth = Dimensions.get('window').width;
+
+  // Generate the labels for the X-axis
+  const getTimeLabels = () => {
+    if (!binaryData.length) return [];
+    return binaryData.map((entry) => `${Math.floor(entry.timestamp)}`);
+  };
+
+  // Decide how often to skip X-axis labels if data is large
+  const skipInterval = binaryData.length > 20 ? 5 : 1;
+
+  return (
+    <SafeAreaView style={{ flex: 1 }}>
+      <Container style={{ paddingHorizontal: 20 }}>
+        <Text style={{ color: theme.colors.text, fontSize: 24, marginBottom: 8 }}>
+          {device.name}
+        </Text>
+
+        <Text style={{ color: statusColor, marginBottom: 5 }}>
+          Status: {buttonState === null ? 'Loading...' : statusText}
+        </Text>
+        <Text style={{ color: isEspConnected ? theme.colors.safe : theme.colors.warning, marginBottom: 10 }}>
+          ESP32 Connection: {isEspConnected ? 'Connected' : 'Disconnected'}
+        </Text>
+
+        {/* Start Monitor Button */}
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 20, width: '100%' }}>
+          <TouchableOpacity
+            style={{
+              backgroundColor: theme.colors.primary,
+              padding: 12,
+              borderRadius: 8,
+              width: '58%',
+              alignItems: 'center',
+            }}
+            onPress={handleStartMonitor}
+            disabled={isMonitoring}
+          >
+            <Text style={{ color: '#fff', fontWeight: 'bold', fontSize: 16 }}>
+              {isMonitoring ? 'Monitoring...' : 'Start Monitor'}
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={() => Linking.openURL('https://example.com/setup')}
+            style={{ justifyContent: 'center' }}
+          >
+            {/* 
+              <Text style={{ color: theme.colors.primary, textDecorationLine: 'underline', fontSize: 16 }}>
+                How to Setup?
+              </Text> 
+            */}
+          </TouchableOpacity>
+        </View>
+
+        {/* Timer */}
+        <View style={{ marginBottom: 20 }}>
+          <Text style={{ color: theme.colors.text, fontSize: 18 }}>
+            Time remaining: {minutes}m {seconds}s
+          </Text>
+        </View>
+
+        {/* Show the graph only if user wants and we have data */}
+        {showGraph && binaryData.length > 0 && (
+          <View style={{ marginBottom: 20, flexDirection: 'row', alignItems: 'center' }}>
+            {/* Y-axis label "Intensity" (rotated) */}
+            <Text
+              style={{
+                color: '#fff',
+                fontSize: 14,
+                fontWeight: 'bold',
+                transform: [{ rotate: '-90deg' }],
+                width: 80,
+                position: 'absolute',
+                left: -40,
+                top: 80,
+                textAlign: 'center',
+              }}
+            >
+              Intensity
+            </Text>
+
+            <View style={{ flex: 1, marginLeft: 20 }}>
+              <LineChart
+                data={{
+                  labels: getTimeLabels(),
+                  datasets: [
+                    {
+                      strokeWidth: 4,
+                      data: binaryData.map((entry) => entry.value),
+                      color: (opacity = 1) => `rgba(255, 165, 0, ${opacity})`,
+                      strokeWidth: 2,
+                    },
+                  ],
+                }}
+                width={screenWidth - 80}
+                height={200}
+                chartConfig={{
+                  backgroundColor: theme.colors.itemBg,
+                  backgroundGradientFrom: theme.colors.itemBg,
+                  backgroundGradientTo: theme.colors.itemBg,
+                  decimalPlaces: 0,
+
+                  // Only label 0 or 1 on the Y-axis
+                  formatYLabel: (value) => {
+                    const val = Math.round(value);
+                    if (val === 0) return '0';
+                    if (val === 1) return '1';
+                    return ''; // Hide all else
+                  },
+
+                  // Skip some X labels if data is large
+                  formatXLabel: (label, index) => {
+                    if (index % skipInterval === 0) return label;
+                    return '';
+                  },
+
+                  color: (opacity = 1) => `rgba(255, 165, 0, ${opacity})`, // line color
+                  labelColor: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
+                  propsForDots: { r: '2', strokeWidth: '2', stroke: '#ffa500' },
+                  propsForBackgroundLines: {
+                    stroke: '#00CED1',
+                    strokeDasharray: '',
+                  },
+                }}
+                fromZero
+                segments={1} // minimal lines on the Y-axis
+                yAxisInterval={1}
+                style={{ borderRadius: 8 }}
+                verticalLabelRotation={0}
+                withShadow={false}
+                withInnerLines
+              />
+              {/* X-axis title */}
+              <View style={{ flexDirection: 'row', justifyContent: 'center', marginTop: 5 }}>
+                <Text style={{ color: '#fff', fontSize: 14, fontWeight: 'bold' }}>t(ms)</Text>
+              </View>
+              <Text style={{ color: '#fff', textAlign: 'center', marginTop: 5 }}>
+                Current State: {binaryData[binaryData.length - 1]?.value ?? 'N/A'}
+              </Text>
+            </View>
+          </View>
+        )}
+      </Container>
+    </SafeAreaView>
+  );
+}
+
+export default DeviceDetailsScreen;
+
+
 // import React, { useState, useEffect, useRef } from 'react';
 // import { View, Text, TouchableOpacity, Alert, Linking } from 'react-native';
 // import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
@@ -1718,347 +2065,3 @@
 // }
 
 // export default DeviceDetailsScreen;
-
-//________________________________________________________________--
-//v8 global connection
-import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, Alert, Linking, Dimensions, SafeAreaView } from 'react-native';
-import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
-import { LineChart } from 'react-native-chart-kit';
-import { Container, theme } from '../config/theme';
-import { rtdb, saveRecordToFirebase } from '../config/firebase';
-import { ref, onValue, off } from 'firebase/database';
-import { useEsp32Connection } from '../Esp32ConnectionContext'; // Adjust the path as needed
-
-function DeviceDetailsScreen({ route, navigation, devices, setDevices }) {
-  const { deviceIndex } = route.params || {};
-  const device = deviceIndex >= 0 && deviceIndex < devices.length ? devices[deviceIndex] : null;
-
-  const time = 10; // monitoring time in seconds
-  const totalTimeMs = time * 1000;
-  const [isMonitoring, setIsMonitoring] = useState(false);
-  const [timeLeft, setTimeLeft] = useState(time);
-  const [showGraph, setShowGraph] = useState(false);
-  const [binaryData, setBinaryData] = useState([]); // [{ value: 0 or 1, timestamp: ms }, ...]
-  const binaryDataRef = useRef([]);
-  const [startTime, setStartTime] = useState(null);
-  const timerRef = useRef(null);
-
-  // Firebase states (only for buttonState, since ESP32 connection is global)
-  const [buttonState, setButtonState] = useState(null);
-  const detectorRef = useRef(null);
-
-  // Get ESP32 connection status from global context
-  const { isEspConnected } = useEsp32Connection();
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // 1. Listen to Firebase for buttonState only (ESP32 connection is handled globally)
-  // ─────────────────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const buttonRef = ref(rtdb, 'buttonState');
-
-    const buttonUnsubscribe = onValue(buttonRef, (snapshot) => {
-      if (snapshot.exists()) {
-        setButtonState(snapshot.val());
-      }
-    });
-
-    return () => {
-      buttonUnsubscribe();
-    };
-  }, []);
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // 2. Timer countdown logic
-  // ─────────────────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    if (isMonitoring) {
-      timerRef.current = setInterval(() => {
-        setTimeLeft((prev) => prev - 1);
-      }, 1000);
-    }
-    return () => {
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-    };
-  }, [isMonitoring]);
-
-  // If time runs out, stop monitoring
-  useEffect(() => {
-    if (timeLeft <= 0 && isMonitoring) {
-      setIsMonitoring(false);
-      finishMonitoring();
-    }
-  }, [timeLeft, isMonitoring]);
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // 3. Collect data from Firebase detectorStatus while monitoring
-  // ─────────────────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    let unsubscribe;
-    if (isMonitoring && startTime) {
-      detectorRef.current = ref(rtdb, 'detectorStatus');
-      unsubscribe = onValue(detectorRef.current, (snapshot) => {
-        if (snapshot.exists()) {
-          const value = snapshot.val(); // 0 or 1 from the sensor
-          const currentTime = Date.now();
-          const timestamp = currentTime - startTime; // ms since we started
-
-          // Only store data if within totalTimeMs
-          if (timestamp <= totalTimeMs) {
-            setBinaryData((prev) => {
-              const newData = [...prev, { value, timestamp }];
-              binaryDataRef.current = newData;
-              return newData;
-            });
-          }
-        }
-      });
-    }
-
-    return () => {
-      if (unsubscribe) unsubscribe();
-      if (detectorRef.current) off(detectorRef.current);
-    };
-  }, [isMonitoring, startTime]);
-
-  // Keep the ref updated with latest array
-  useEffect(() => {
-    binaryDataRef.current = binaryData;
-  }, [binaryData]);
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // 4. Start monitoring
-  // ─────────────────────────────────────────────────────────────────────────────
-  const handleStartMonitor = () => {
-    // if (!device?.isConnected) {
-    //   Alert.alert('Device not connected', 'Please connect this device first.');
-    //   return;
-    // }
-    if (!isEspConnected) {
-      Alert.alert('ESP32 Disconnected', 'Please check the ESP32 WiFi connection.');
-      return;
-    }
-    if (!isReady) {
-      Alert.alert('Cap not close', 'Please close the cap properly.');
-      return;
-    }
-    // Reset
-    setTimeLeft(time);
-    setBinaryData([]);
-    binaryDataRef.current = [];
-
-    setStartTime(Date.now());
-    setShowGraph(true);
-    setIsMonitoring(true);
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // 5. Finish monitoring and save to Firebase
-  // ─────────────────────────────────────────────────────────────────────────────
-  const finishMonitoring = () => {
-    const dataToSave = binaryDataRef.current;
-    if (dataToSave.length === 0) {
-      Alert.alert('No Data', 'No data was collected during monitoring.');
-      return;
-    }
-
-    // Basic logic: if more than half are "1", we say "Safe to consume"
-    const onesCount = dataToSave.filter((entry) => entry.value === 1).length;
-    const status = onesCount > dataToSave.length / 2 ? 'Safe to consume' : 'Might not be safe';
-    const color = onesCount > dataToSave.length / 2 ? '#32CD32' : '#FF4500';
-
-    const newRecord = {
-      location: 'Klang',
-      date: new Date().toLocaleDateString('en-GB'), // e.g. "01/03/2025"
-      time: new Date().toLocaleTimeString('en-US', {
-        hour12: false,
-        hour: '2-digit',
-        minute: '2-digit',
-      }), // e.g. "14:30"
-      status,
-      color,
-      dataset: dataToSave,
-    };
-
-    saveRecordToFirebase(newRecord)
-      .then(() => {
-        Alert.alert('Monitoring Complete', 'Data has been saved to Firebase.');
-      })
-      .catch((error) => {
-        Alert.alert('Error', 'Failed to save data: ' + error.message);
-      });
-
-    // setShowGraph(false);
-  };
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // 6. Early return if no device
-  // ─────────────────────────────────────────────────────────────────────────────
-  if (!device) {
-    return (
-      <Container>
-        <Text style={{ color: theme.colors.text }}>Device not found!</Text>
-      </Container>
-    );
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  // 7. Display states
-  // ─────────────────────────────────────────────────────────────────────────────
-  const minutes = Math.floor(timeLeft / 60);
-  const seconds = timeLeft % 60;
-  const isReady = buttonState === 1;
-  const statusColor = isEspConnected && isReady ? theme.colors.safe : theme.colors.warning;
-  const statusText = isEspConnected && isReady ? 'Ready' : 'Not Ready';
-  const screenWidth = Dimensions.get('window').width;
-
-  // Generate the labels for the X-axis
-  const getTimeLabels = () => {
-    if (!binaryData.length) return [];
-    return binaryData.map((entry) => `${Math.floor(entry.timestamp)}`);
-  };
-
-  // Decide how often to skip X-axis labels if data is large
-  const skipInterval = binaryData.length > 20 ? 5 : 1;
-
-  return (
-    <SafeAreaView style={{ flex: 1 }}>
-      <Container style={{ paddingHorizontal: 20 }}>
-        <Text style={{ color: theme.colors.text, fontSize: 24, marginBottom: 8 }}>
-          {device.name}
-        </Text>
-
-        <Text style={{ color: statusColor, marginBottom: 5 }}>
-          Status: {buttonState === null ? 'Loading...' : statusText}
-        </Text>
-        <Text style={{ color: isEspConnected ? theme.colors.safe : theme.colors.warning, marginBottom: 10 }}>
-          ESP32 Connection: {isEspConnected ? 'Connected' : 'Disconnected'}
-        </Text>
-
-        {/* Start Monitor Button */}
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 20, width: '100%' }}>
-          <TouchableOpacity
-            style={{
-              backgroundColor: theme.colors.primary,
-              padding: 12,
-              borderRadius: 8,
-              width: '58%',
-              alignItems: 'center',
-            }}
-            onPress={handleStartMonitor}
-            disabled={isMonitoring}
-          >
-            <Text style={{ color: '#fff', fontWeight: 'bold', fontSize: 16 }}>
-              {isMonitoring ? 'Monitoring...' : 'Start Monitor'}
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            onPress={() => Linking.openURL('https://example.com/setup')}
-            style={{ justifyContent: 'center' }}
-          >
-            {/* 
-              <Text style={{ color: theme.colors.primary, textDecorationLine: 'underline', fontSize: 16 }}>
-                How to Setup?
-              </Text> 
-            */}
-          </TouchableOpacity>
-        </View>
-
-        {/* Timer */}
-        <View style={{ marginBottom: 20 }}>
-          <Text style={{ color: theme.colors.text, fontSize: 18 }}>
-            Time remaining: {minutes}m {seconds}s
-          </Text>
-        </View>
-
-        {/* Show the graph only if user wants and we have data */}
-        {showGraph && binaryData.length > 0 && (
-          <View style={{ marginBottom: 20, flexDirection: 'row', alignItems: 'center' }}>
-            {/* Y-axis label "Intensity" (rotated) */}
-            <Text
-              style={{
-                color: '#fff',
-                fontSize: 14,
-                fontWeight: 'bold',
-                transform: [{ rotate: '-90deg' }],
-                width: 80,
-                position: 'absolute',
-                left: -40,
-                top: 80,
-                textAlign: 'center',
-              }}
-            >
-              Intensity
-            </Text>
-
-            <View style={{ flex: 1, marginLeft: 20 }}>
-              <LineChart
-                data={{
-                  labels: getTimeLabels(),
-                  datasets: [
-                    {
-                      strokeWidth: 4,
-                      data: binaryData.map((entry) => entry.value),
-                      color: (opacity = 1) => `rgba(255, 165, 0, ${opacity})`,
-                      strokeWidth: 2,
-                    },
-                  ],
-                }}
-                width={screenWidth - 80}
-                height={200}
-                chartConfig={{
-                  backgroundColor: theme.colors.itemBg,
-                  backgroundGradientFrom: theme.colors.itemBg,
-                  backgroundGradientTo: theme.colors.itemBg,
-                  decimalPlaces: 0,
-
-                  // Only label 0 or 1 on the Y-axis
-                  formatYLabel: (value) => {
-                    const val = Math.round(value);
-                    if (val === 0) return '0';
-                    if (val === 1) return '1';
-                    return ''; // Hide all else
-                  },
-
-                  // Skip some X labels if data is large
-                  formatXLabel: (label, index) => {
-                    if (index % skipInterval === 0) return label;
-                    return '';
-                  },
-
-                  color: (opacity = 1) => `rgba(255, 165, 0, ${opacity})`, // line color
-                  labelColor: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
-                  propsForDots: { r: '2', strokeWidth: '2', stroke: '#ffa500' },
-                  propsForBackgroundLines: {
-                    stroke: '#00CED1',
-                    strokeDasharray: '',
-                  },
-                }}
-                fromZero
-                segments={1} // minimal lines on the Y-axis
-                yAxisInterval={1}
-                style={{ borderRadius: 8 }}
-                verticalLabelRotation={0}
-                withShadow={false}
-                withInnerLines
-              />
-              {/* X-axis title */}
-              <View style={{ flexDirection: 'row', justifyContent: 'center', marginTop: 5 }}>
-                <Text style={{ color: '#fff', fontSize: 14, fontWeight: 'bold' }}>t(ms)</Text>
-              </View>
-              <Text style={{ color: '#fff', textAlign: 'center', marginTop: 5 }}>
-                Current State: {binaryData[binaryData.length - 1]?.value ?? 'N/A'}
-              </Text>
-            </View>
-          </View>
-        )}
-      </Container>
-    </SafeAreaView>
-  );
-}
-
-export default DeviceDetailsScreen;
